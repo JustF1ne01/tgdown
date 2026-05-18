@@ -40,16 +40,8 @@
 | `tg_app_version` | 否 | `""` | 可选，会话里显示的应用版本；留空则使用 Telethon 默认 |
 | `tg_message_prefix` | 否 | `"[tgdown]"` | 脚本自动发往群的消息会在**首行**加该标识（与正文换行分隔），便于与人工消息区分；设为 `""` 则不加 |
 | `target_group_name` | 否 | `"downapp"` | 监听的目标群名称，需与群标题一致 |
-| `download_path` | 否 | `"./downloads"` | 下载保存目录，相对路径基于 `data` 的父目录 |
-| `temp_path` | 否 | `"./temp_downloads"` | 临时下载目录，下载过程中的 `temp_*` 文件只会放这里，相对路径基于 `data` 的父目录 |
 | `web_port` | 否 | `8765` | Web 面板端口 |
-| `web_bind` | 否 | `"0.0.0.0"` | Web 绑定地址，仅本机访问可填 `127.0.0.1` |
 | `concurrent_downloads` | 否 | `3` | 并发下载数 |
-| `push_status_to_group` | 否 | `true` | 是否把状态消息推送到目标群（含下载进度、启动完成通知等） |
-| `download_retries` | 否 | `2` | 下载失败或卡住时的重试次数 |
-| `download_stall_seconds` | 否 | `600` | 连续多少秒无进度视为卡住并重试，`0` 表示关闭 |
-| `cron_send_current_time_cron` | 否 | `""` | 定时发送当前时间的 cron 表达式，支持 5 或 6 字段 |
-| `cron_push_download_progress_cron` | 否 | `""` | 定时推送下载进度的 cron 表达式，仅在有任务下载时推送 |
 | `openai_api_key` | 否 | `""` | OpenAI 兼容接口的 API Key，用于 AI 命名 |
 | `openai_base_url` | 否 | `""` | OpenAI 兼容接口地址，例如 `https://api.openai.com/v1` |
 | `tg_proxy_type` | 否 | `""` | Telegram 代理类型，可选 `socks5`、`socks4`、`http` |
@@ -61,6 +53,7 @@
 
 ### 配置示例
 
+
 ```json
 {
   "api_id": 36684684,
@@ -69,14 +62,9 @@
   "tg_system_version": "",
   "tg_app_version": "",
   "tg_message_prefix": "[tgdown]",
-  "download_path": "./downloads",
-  "temp_path": "./temp_downloads",
   "web_port": 8765,
   "target_group_name": "tgdown",
   "concurrent_downloads": 3,
-  "push_status_to_group": true,
-  "cron_send_current_time_cron": "1 1 9 * *",
-  "cron_push_download_progress_cron": "1 1/5 * * *",
   "openai_api_key": "",
   "openai_base_url": "",
   "tg_proxy_type": "http",
@@ -98,6 +86,7 @@
 cd tgdown
 # 第一次使用需要初始化session信息，运行脚本后，输入手机号然后发送验证码，用验证码登录成功后获取到session就可以了
 # 第一次使用先手动在挂载目录下创建配置文件 config.json 然后运行容器
+# downloads、temp_downloads、session、日志都会默认落到 /data 下
 # 默认amd架构, 如果需要arm架构 运行的时候修改镜像版本为 xxgl/tgdown:1.1-arm
 docker run --rm -it \
   --name tgdown \
@@ -110,13 +99,12 @@ docker run --rm -it \
 ![session](/docs/images/session.png)
 ```bash
 cd tgdown
-# 运行（挂载 data 和 downloads 目录，端口 8765）
+# 运行时只需要挂载 data 目录，下载目录和临时目录默认都在 /data 下
 # 运行时需要把挂载路径替换为自己的实际路径
 docker run -d \
   --name tgdown \
   --network host \
   -v "/data/server/downapp/data:/data" \
-  -v "/data/yp/downloads:/downloads" \
   --restart=always \
   xxgl/tgdown:1.2
 ```

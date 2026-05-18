@@ -1,8 +1,4 @@
 from telethon import TelegramClient, events
-try:
-    from croniter import croniter  # type: ignore
-except Exception:  # pragma: no cover
-    croniter = None  # type: ignore
 import os
 import asyncio
 import threading
@@ -18,16 +14,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
+from openai import OpenAI
 
 try:
     import socks  # type: ignore
 except ImportError:  # pragma: no cover - 仅在未安装 PySocks 时触发
     socks = None  # type: ignore
-
-try:
-    from lib.ai import generate_video_filename_from_text
-except ImportError:
-    generate_video_filename_from_text = None
 from fastapi.responses import FileResponse
 import uvicorn
 
@@ -86,10 +78,8 @@ api_hash = str(_config["api_hash"]).strip()
 DOWNLOAD_PATH = _config.get("download_path", "./downloads")
 TEMP_PATH = _config.get("temp_path", "./temp_downloads")
 WEB_PORT = int(_config.get("web_port", 8765))
-WEB_BIND = _config.get("web_bind", "0.0.0.0")  # 可选：仅本机访问填 127.0.0.1
 TARGET_GROUP_NAME = _config.get("target_group_name", "downapp")
 CONCURRENT_DOWNLOADS = max(1, int(_config.get("concurrent_downloads", 3)))
-PUSH_STATUS_TO_GROUP = _config.get("push_status_to_group", True)
 DOWNLOAD_RETRIES = max(0, int(_config.get("download_retries", 2)))  # 下载失败或卡住时重试次数，默认 2
 # 若连续多少秒没有新的下载进度则判定为卡住并重试；0 表示不检测（大文件友好）
 DOWNLOAD_STALL_SECONDS = max(0, int(_config.get("download_stall_seconds", 600)))
@@ -101,6 +91,8 @@ TG_SYSTEM_VERSION = str(_config.get("tg_system_version") or "").strip() or None
 TG_APP_VERSION = str(_config.get("tg_app_version") or "").strip() or None
 # 发往目标群的消息前加标识行，便于与人工消息区分；留空则不加
 TG_MESSAGE_PREFIX = str(_config.get("tg_message_prefix", "[tgdown]")).strip()
+OPENAI_API_KEY = str(_config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY") or "").strip() or None
+OPENAI_BASE_URL = str(_config.get("openai_base_url") or os.environ.get("OPENAI_BASE_URL") or "").strip() or None
 
 
 def _apply_outgoing_message_prefix(text: str) -> str:
@@ -119,25 +111,97 @@ def _telegram_client_extra_kwargs() -> dict:
     return kw
 
 
-# ---------- 定时发送（cron） ----------
-# 支持 5 字段或 6 字段 cron：
-# - 5 字段：分钟 小时 日 月 星期（例如：*/5 * * * *）
-# - 6 字段：秒 分钟 小时 日 月 星期（例如：*/10 * * * * *）
-CRON_SEND_CURRENT_TIME_CRON = str(_config.get("cron_send_current_time_cron", "")).strip()
-CRON_SEND_CURRENT_TIME_ENABLED = bool(CRON_SEND_CURRENT_TIME_CRON)
-CRON_PUSH_DOWNLOAD_PROGRESS_CRON = str(_config.get("cron_push_download_progress_cron", "")).strip()
-CRON_PUSH_DOWNLOAD_PROGRESS_ENABLED = bool(CRON_PUSH_DOWNLOAD_PROGRESS_CRON)
+def _build_openai_client(base_url: str | None = None) -> OpenAI:
+    api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("请在 data/config.json 中配置 openai_api_key，或设置环境变量 OPENAI_API_KEY")
+    url = (base_url or OPENAI_BASE_URL or "").strip() or None
+    return OpenAI(api_key=api_key, base_url=url) if url else OpenAI(api_key=api_key)
 
-# 为了让配置文件尽量“只放 cron 表达式”，时间格式与文案在代码里使用默认值。
-CRON_SEND_CURRENT_TIME_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-CRON_SEND_CURRENT_TIME_MESSAGE_TEMPLATE = "corn定时发送 - 当前时间：{time}"
 
-if CRON_SEND_CURRENT_TIME_ENABLED and croniter is None:
-    log.error("已配置 cron_send_current_time_cron，但缺少 croniter 依赖，请运行: pip install croniter")
-    CRON_SEND_CURRENT_TIME_ENABLED = False
-if CRON_PUSH_DOWNLOAD_PROGRESS_ENABLED and croniter is None:
-    log.error("已配置 cron_push_download_progress_cron，但缺少 croniter 依赖，请运行: pip install croniter")
-    CRON_PUSH_DOWNLOAD_PROGRESS_ENABLED = False
+def chat_with_gpt(
+    user_message: str,
+    model: str = "gpt-3.5-turbo",
+    system_prompt: str = "你是一个有帮助的助手。",
+    history: list[dict] | None = None,
+    base_url: str | None = None,
+) -> tuple[str, list[dict]]:
+    """与 OpenAI 兼容接口对话，支持多轮上下文。"""
+    client = _build_openai_client(base_url=base_url)
+    messages = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+    )
+    assistant_message = resp.choices[0].message.content or ""
+    new_history = (history or []) + [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": assistant_message},
+    ]
+    return assistant_message, new_history
+
+
+_AI_FILENAME_FORBIDDEN = set('/\\:*?"<>|()（）')
+_AI_FILENAME_PUNCT_TO_UNDERSCORE = set('，。、；：！？,.;:!?\'" \t\n\r')
+
+
+def _sanitize_ai_filename(s: str) -> str:
+    """清理 AI 生成的文件名：只保留中英文、数字和部分安全字符。"""
+    s = unicodedata.normalize("NFKC", s.strip().strip('\"\\\''))
+    cleaned: list[str] = []
+    for ch in s:
+        if ch in _AI_FILENAME_FORBIDDEN or ch in _AI_FILENAME_PUNCT_TO_UNDERSCORE:
+            cleaned.append("_")
+            continue
+        cat = unicodedata.category(ch)
+        if cat and cat[0] in ("L", "N"):
+            cleaned.append(ch)
+        elif ch in {"_", "-"}:
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    s2 = "".join(cleaned)
+    s2 = "_".join(s2.split())
+    while "__" in s2:
+        s2 = s2.replace("__", "_")
+    return s2.strip("_") or "video"
+
+
+def generate_video_filename_from_text(
+    text: str,
+    model: str = "gpt-4o-mini",
+    base_url: str | None = None,
+) -> str:
+    """从文本中提取核心关键词，生成适合保存的视频文件名。"""
+    system_prompt = """你是一个视频文件名生成助手。
+
+你的任务：从用户给出的文本中提取**最核心的关键词**，组成一个**简短**的视频文件名。
+
+长度与数量要求（必须遵守）：
+- 只提取 **4～8 个** 最核心关键词，宁少勿多。
+- 总长度（含下划线）控制在 **40 个字符以内**，越短越好。
+- 优先保留最能概括内容、最具辨识度的词，次要的舍去。
+
+格式规则：
+1. 输出中**禁止出现空格和任何标点**（包括逗号、句号、顿号等），多个关键词只用**半角下划线**_连接，例如：词A_词B_词C。
+2. 不要加文件扩展名、不要加引号、不要输出任何解释，只输出一行纯文件名。
+3. 不要使用 / \\ : * ? \" < > | 等非法文件名字符；可用中文、英文、数字、下划线、短横线，中文关键词请**直接保留中文**，不要转成拼音。
+4. 只输出有意义的**实词/关键词**，不要输出虚词、助词（如：的、了、被、让、叫、是、在、把、让、给、着、过等）。
+5. 关键词按原文提取，不要美化，不要去除露骨或成人向描述；若词过长可适当缩写。
+"""
+
+    user_message = f"请从以下文本中提取 4～8 个最核心关键词，生成简短的文件名（总长 40 字以内，只输出文件名一行）：\n\n{text}"
+    reply, _ = chat_with_gpt(
+        user_message,
+        model=model,
+        system_prompt=system_prompt,
+        base_url=base_url,
+    )
+    return _sanitize_ai_filename(reply)
 
 
 def _build_tg_proxy_from_config():
@@ -172,19 +236,19 @@ def _build_tg_proxy_from_config():
 
 
 def _resolve_storage_dir(path_value: str, default_name: str) -> Path:
-    """把配置目录解析为绝对路径；相对路径基于 data 的父目录。"""
+    """把配置目录解析为绝对路径；相对路径基于 data 目录本身。"""
     p = Path(path_value or default_name)
     if not p.is_absolute():
-        p = DATA_DIR.parent / p
+        p = DATA_DIR / p
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-# 下载目录、临时目录：与 data 同级（相对路径基于 DATA_DIR 的父目录）
+# 下载目录、临时目录默认位于 data 目录下（相对路径基于 DATA_DIR）
 DOWNLOAD_PATH = _resolve_storage_dir(str(DOWNLOAD_PATH or ""), "downloads")
 TEMP_PATH = _resolve_storage_dir(str(TEMP_PATH or ""), "temp_downloads")
 if DOWNLOAD_PATH.resolve() == TEMP_PATH.resolve():
-    adjusted_temp = DOWNLOAD_PATH.parent / "temp_downloads"
+    adjusted_temp = DATA_DIR / "temp_downloads"
     if adjusted_temp.resolve() == DOWNLOAD_PATH.resolve():
         adjusted_temp = DOWNLOAD_PATH.parent / f"{DOWNLOAD_PATH.name}_temp"
     adjusted_temp.mkdir(parents=True, exist_ok=True)
@@ -573,10 +637,6 @@ def _is_already_queued(chat_id: int, message_id: int) -> bool:
 
 async def _send_to_target_group(text: str, *, kind: str = "status") -> tuple[bool, str | None]:
     """向目标群发送文本。返回 (是否成功, 失败原因)；成功时第二项为 None。"""
-    if not PUSH_STATUS_TO_GROUP:
-        reason = "push_status_to_group 已关闭"
-        log.debug("群消息未发送 kind=%s: %s", kind, reason)
-        return False, reason
     if _target_chat_id is None:
         reason = "目标群 chat_id 未就绪"
         log.warning("群消息发送失败 kind=%s: %s", kind, reason)
@@ -633,13 +693,10 @@ async def _ensure_target_chat():
 
 
 async def _notify_startup_ready():
-    """进程启动完成后向目标群推送一次上线通知（含当前时间）。受 push_status_to_group 控制。"""
-    if not PUSH_STATUS_TO_GROUP:
-        log.debug("跳过启动推送: push_status_to_group 已关闭")
-        return
+    """进程启动完成后向目标群推送一次上线通知（含当前时间）。"""
     try:
         await _ensure_target_chat()
-        time_str = datetime.now().strftime(CRON_SEND_CURRENT_TIME_TIME_FORMAT)
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         text = f"✅ tgdown 已启动完成\n当前时间: {time_str}"
         ok, err = await _send_to_target_group(text, kind="startup")
         if ok:
@@ -1257,8 +1314,6 @@ async def handler(event):
         )
         if echo_ok:
             echo_note = "成功"
-        elif echo_err == "push_status_to_group 已关闭":
-            echo_note = "未发送(功能已关闭)"
         else:
             echo_note = f"失败({echo_err})"
     log.info(
@@ -1322,141 +1377,7 @@ def index():
 
 # ---------- 启动 ----------
 def run_web():
-    uvicorn.run(app, host=WEB_BIND, port=WEB_PORT, log_level="warning")
-
-
-async def _cron_send_current_time_once(send_dt: datetime):
-    """向目标群发送一次“当前时间”。"""
-    if not CRON_SEND_CURRENT_TIME_ENABLED:
-        return
-    try:
-        if _target_chat_id is None:
-            await _ensure_target_chat()
-        if _target_chat_id is None:
-            log.warning("cron 发送失败：未能解析到目标群 chat_id（%s）", TARGET_GROUP_NAME)
-            return
-
-        time_str = send_dt.strftime(CRON_SEND_CURRENT_TIME_TIME_FORMAT)
-        text = CRON_SEND_CURRENT_TIME_MESSAGE_TEMPLATE.format(time=time_str)
-        ok, err = await _send_to_target_group(text, kind="cron_current_time")
-        if ok:
-            log.info("cron 已发送当前时间: %s", time_str)
-        else:
-            log.warning("cron 发送当前时间未成功: %s", err)
-    except Exception as e:
-        log.warning("cron 发送当前时间到群失败: %s", e)
-
-
-async def _cron_push_download_progress_once(send_dt: datetime):
-    """定时推送下载进度；无下载任务时跳过。"""
-    if not CRON_PUSH_DOWNLOAD_PROGRESS_ENABLED:
-        return
-    try:
-        if _target_chat_id is None:
-            await _ensure_target_chat()
-        if _target_chat_id is None:
-            log.warning("下载进度播报失败：未能解析到目标群 chat_id（%s）", TARGET_GROUP_NAME)
-            return
-        text = _build_download_progress_status_text()
-        if not text:
-            log.info("cron 下载进度播报跳过：当前没有进行中的下载任务")
-            return
-        ok, err = await _send_to_target_group(text, kind="cron_download_progress")
-        if ok:
-            log.info("cron 已推送下载进度: %s", send_dt.strftime("%Y-%m-%d %H:%M:%S"))
-        else:
-            log.warning("cron 推送下载进度未成功: %s", err)
-    except Exception as e:
-        log.warning("cron 推送下载进度到群失败: %s", e)
-
-
-async def _cron_send_current_time_loop():
-    """根据 cron 表达式定时发送当前时间。"""
-    if not CRON_SEND_CURRENT_TIME_ENABLED:
-        return
-    if croniter is None:  # 理论上不会发生（上面已禁用）
-        log.error("croniter 依赖缺失，cron 任务已禁用")
-        return
-    expr = CRON_SEND_CURRENT_TIME_CRON
-    fields = expr.split()
-    if len(fields) not in (5, 6):
-        log.error("cron 表达式字段数不合法: %r（支持 5 字段或 6 字段）", expr)
-        return
-
-    second_at_beginning = len(fields) == 6
-    try:
-        ci = croniter(
-            expr,
-            datetime.now(),
-            ret_type=datetime,
-            second_at_beginning=second_at_beginning,
-        )
-        next_dt = ci.get_next(datetime)
-        log.info("cron 定时发送已启用: expr=%s, next=%s", expr, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-    except Exception as e:
-        log.error("cron 表达式解析失败: %r，错误: %s", expr, e)
-        return
-
-    while True:
-        now = datetime.now()
-        delay = (next_dt - now).total_seconds()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        else:
-            # 如果系统时间变动导致已过期，直接立即发送一次
-            await asyncio.sleep(0)
-
-        await _cron_send_current_time_once(next_dt)
-        try:
-            next_dt = ci.get_next(datetime)
-            log.info("cron 下一次触发时间: %s", next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-        except Exception as e:
-            log.error("cron 计算下一次触发时间失败: %s", e)
-            return
-
-
-async def _cron_push_download_progress_loop():
-    """根据 cron 表达式定时推送下载进度。"""
-    if not CRON_PUSH_DOWNLOAD_PROGRESS_ENABLED:
-        return
-    if croniter is None:
-        log.error("croniter 依赖缺失，下载进度播报任务已禁用")
-        return
-    expr = CRON_PUSH_DOWNLOAD_PROGRESS_CRON
-    fields = expr.split()
-    if len(fields) not in (5, 6):
-        log.error("下载进度播报 cron 表达式字段数不合法: %r（支持 5 字段或 6 字段）", expr)
-        return
-
-    second_at_beginning = len(fields) == 6
-    try:
-        ci = croniter(
-            expr,
-            datetime.now(),
-            ret_type=datetime,
-            second_at_beginning=second_at_beginning,
-        )
-        next_dt = ci.get_next(datetime)
-        log.info("cron 下载进度播报已启用: expr=%s, next=%s", expr, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-    except Exception as e:
-        log.error("下载进度播报 cron 表达式解析失败: %r，错误: %s", expr, e)
-        return
-
-    while True:
-        now = datetime.now()
-        delay = (next_dt - now).total_seconds()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        else:
-            await asyncio.sleep(0)
-
-        await _cron_push_download_progress_once(next_dt)
-        try:
-            next_dt = ci.get_next(datetime)
-            log.info("下载进度播报 cron 下一次触发时间: %s", next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-        except Exception as e:
-            log.error("下载进度播报 cron 计算下一次触发时间失败: %s", e)
-            return
+    uvicorn.run(app, host="0.0.0.0", port=WEB_PORT, log_level="warning")
 
 
 if __name__ == "__main__":
@@ -1481,10 +1402,6 @@ if __name__ == "__main__":
         for _ in range(CONCURRENT_DOWNLOADS):
             asyncio.create_task(_download_worker())
         await _restore_unfinished_tasks()
-        if CRON_SEND_CURRENT_TIME_ENABLED:
-            asyncio.create_task(_cron_send_current_time_loop())
-        if CRON_PUSH_DOWNLOAD_PROGRESS_ENABLED:
-            asyncio.create_task(_cron_push_download_progress_loop())
 
     with client:
         client.loop.run_until_complete(_start())
