@@ -86,7 +86,7 @@
 cd tgdown
 # 第一次使用需要初始化session信息，运行脚本后，输入手机号然后发送验证码，用验证码登录成功后获取到session就可以了
 # 第一次使用先手动在挂载目录下创建配置文件 config.json 然后运行容器
-# downloads、temp_downloads、session、日志都会默认落到 /data 下
+# downloads、temp_downloads、session、日志都会默认落到 挂载目录 下
 # 默认amd架构, 如果需要arm架构 运行的时候修改镜像版本为 xxgl/tgdown:1.1-arm
 docker run --rm -it \
   --name tgdown \
