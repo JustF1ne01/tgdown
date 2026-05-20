@@ -1388,7 +1388,7 @@ if __name__ == "__main__":
     log.info("日志文件: %s", LOG_PATH)
     log.info("下载目录: %s", DOWNLOAD_PATH)
     log.info("临时目录: %s", TEMP_PATH)
-    log.info("Web 已启动: port=%s bind=%s", WEB_PORT, WEB_BIND)
+    log.info("Web 已启动: port=%s bind=%s", WEB_PORT, "0.0.0.0")
     log.info(
         "并发数: %s，卡住检测: %ss 无进度则重试，失败重试: %s 次",
         CONCURRENT_DOWNLOADS,
