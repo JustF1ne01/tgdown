@@ -113,8 +113,11 @@ docker run -d \
 ## Docker 面板部署
 1、在挂载目录创建 config.json 配置文件，配置文件填写正确配置信息后，创建运行容器时挂载到容器的/data 目录下然后运行容器。
 ![init](/docs/images/fn1.png)
+![init](/docs/images/fn2.png)
 2、打开容器的 bash 命令行需要手动执行命令(python tgdown.py)进行初始化
+
 3、输入账号和登录验证码信息
+
 4、在面板重启容器。
 ![init](/docs/images/fn3.png)
 ![init](/docs/images/fn4.png)
